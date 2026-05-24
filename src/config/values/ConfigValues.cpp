@@ -539,7 +539,11 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Bool>("xwayland:use_nearest_neighbor", "uses the nearest neighbor filtering for xwayland apps, making them pixelated rather than blurry", true),
         MS<Bool>("xwayland:force_zero_scaling", "forces a scale of 1 on xwayland windows on scaled displays.", false),
         MS<Bool>("xwayland:create_abstract_socket", "Create the abstract Unix domain socket for XWayland", false),
+#ifdef XWAYLAND_SATELLITE_PATH
+        MS<String>("xwayland:satellite_path", "path to xwayland-satellite binary, used when built with USE_XWAYLAND_SATELLITE", XWAYLAND_SATELLITE_PATH),
+#else
         MS<String>("xwayland:satellite_path", "path to xwayland-satellite binary, used when built with USE_XWAYLAND_SATELLITE", "xwayland-satellite"),
+#endif
 
         /*
          * opengl:

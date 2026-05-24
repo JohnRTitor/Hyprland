@@ -463,7 +463,13 @@ void CXWaylandSatellite::spawn() {
 
             execlp(satPath.c_str(), satPath.c_str(), m_displayName.c_str(), "-listenfd", abstractStr.c_str(), "-listenfd", unixStr.c_str(), nullptr);
 
-            Log::logger->log(Log::ERR, "[XWayland-Satellite] Failed to exec {}: {}", satPath, strerror(errno));
+            // exec failed — only async-signal-safe calls are permitted in a child
+            // of a multithreaded process. Using the logger here would risk a
+            // deadlock if another thread held the logger mutex at the time of fork().
+            static constexpr char ERR_PREFIX[] = "[XWayland-Satellite] Failed to exec: ";
+            (void)write(STDERR_FILENO, ERR_PREFIX, sizeof(ERR_PREFIX) - 1);
+            (void)write(STDERR_FILENO, satPath.c_str(), satPath.size());
+            (void)write(STDERR_FILENO, "\n", 1);
             _exit(127);
         }
 

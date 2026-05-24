@@ -230,17 +230,20 @@ customStdenv.mkDerivation (finalAttrs: {
   # we want as much debug info as possible
   dontStrip = debug;
 
-  cmakeFlags = mapAttrsToList cmakeBool {
-    "BUILT_WITH_NIX" = true;
-    "NO_XWAYLAND" = !enableXWayland;
-    "USE_XWAYLAND_SATELLITE" = enableXWayland && enableXWaylandSatellite;
-    "LEGACY_RENDERER" = legacyRenderer;
-    "NO_SYSTEMD" = !withSystemd;
-    "CMAKE_DISABLE_PRECOMPILE_HEADERS" = true;
-    "NO_UWSM" = !withSystemd;
-    "TRACY_ENABLE" = false;
-    "WITH_TESTS" = withTests;
-  };
+  cmakeFlags =
+    mapAttrsToList cmakeBool {
+      "BUILT_WITH_NIX" = true;
+      "NO_XWAYLAND" = !enableXWayland;
+      "USE_XWAYLAND_SATELLITE" = enableXWayland && enableXWaylandSatellite;
+      "LEGACY_RENDERER" = legacyRenderer;
+      "NO_SYSTEMD" = !withSystemd;
+      "CMAKE_DISABLE_PRECOMPILE_HEADERS" = true;
+      "NO_UWSM" = !withSystemd;
+      "TRACY_ENABLE" = false;
+      "WITH_TESTS" = withTests;
+    }
+    ++ optional (enableXWayland && enableXWaylandSatellite)
+      "-DXWAYLAND_SATELLITE_PATH=${xwayland-satellite}/bin/xwayland-satellite";
 
   preConfigure = ''
     substituteInPlace hyprtester/CMakeLists.txt --replace-fail \
@@ -252,15 +255,12 @@ customStdenv.mkDerivation (finalAttrs: {
     ${optionalString wrapRuntimeDeps ''
       wrapProgram $out/bin/Hyprland \
         --suffix PATH : ${
-          makeBinPath (
-            [
-              binutils
-              hyprland-guiutils
-              pciutils
-              pkgconf
-            ]
-            ++ optional (enableXWayland && enableXWaylandSatellite) xwayland-satellite
-          )
+          makeBinPath [
+            binutils
+            hyprland-guiutils
+            pciutils
+            pkgconf
+          ]
         }
     ''}
 
