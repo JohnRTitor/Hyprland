@@ -49,9 +49,11 @@
   wayland-protocols,
   wayland-scanner,
   xwayland,
+  xwayland-satellite,
   debug ? false,
   withTests ? debug,
   enableXWayland ? true,
+  enableXWaylandSatellite ? true,
   withSystemd ? lib.meta.availableOn stdenv.hostPlatform systemd,
   wrapRuntimeDeps ? true,
   version ? "git",
@@ -207,13 +209,16 @@ customStdenv.mkDerivation (finalAttrs: {
     ]
     (optionals customStdenv.hostPlatform.isBSD [ epoll-shim ])
     (optionals customStdenv.hostPlatform.isMusl [ libexecinfo ])
-    (optionals enableXWayland [
+    (optionals (enableXWayland && !enableXWaylandSatellite) [
       libxcb
       libxcb-errors
       libxcb-render-util
       libxcb-wm
       libxdmcp
       xwayland
+    ])
+    (optionals (enableXWayland && enableXWaylandSatellite) [
+      xwayland-satellite
     ])
     (optional withSystemd systemd)
   ];
@@ -228,6 +233,7 @@ customStdenv.mkDerivation (finalAttrs: {
   cmakeFlags = mapAttrsToList cmakeBool {
     "BUILT_WITH_NIX" = true;
     "NO_XWAYLAND" = !enableXWayland;
+    "USE_XWAYLAND_SATELLITE" = enableXWayland && enableXWaylandSatellite;
     "LEGACY_RENDERER" = legacyRenderer;
     "NO_SYSTEMD" = !withSystemd;
     "CMAKE_DISABLE_PRECOMPILE_HEADERS" = true;
@@ -246,12 +252,15 @@ customStdenv.mkDerivation (finalAttrs: {
     ${optionalString wrapRuntimeDeps ''
       wrapProgram $out/bin/Hyprland \
         --suffix PATH : ${
-          makeBinPath [
-            binutils
-            hyprland-guiutils
-            pciutils
-            pkgconf
-          ]
+          makeBinPath (
+            [
+              binutils
+              hyprland-guiutils
+              pciutils
+              pkgconf
+            ]
+            ++ optional (enableXWayland && enableXWaylandSatellite) xwayland-satellite
+          )
         }
     ''}
 
