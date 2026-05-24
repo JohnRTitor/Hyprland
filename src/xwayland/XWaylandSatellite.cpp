@@ -5,12 +5,12 @@
 #include "../Compositor.hpp"
 #include "../config/ConfigValue.hpp"
 #include "../debug/log/Logger.hpp"
-#include "../helpers/fs/FsUtils.hpp"
 
 #include <cerrno>
+#include <csignal>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
-#include <csignal>
 #include <fcntl.h>
 #include <format>
 #include <filesystem>
@@ -30,18 +30,22 @@ constexpr int SOCKET_BACKLOG         = 1;
 constexpr int MAX_DISPLAY_RETRIES    = 50;
 constexpr int LOCK_FILE_MODE         = 0444;
 
-static bool   safeRemove(const std::string& path) {
+static bool safeRemove(const std::string& path) {
     try {
         return std::filesystem::remove(path);
     } catch (const std::exception& e) { Log::logger->log(Log::ERR, "[XWayland-Satellite] Failed to remove {}", path); }
+
     return false;
 }
 
-static std::string getSocketPath(int display) {
-    return std::format("/tmp/.X11-unix/X{}", display);
+static std::string getSocketPath(int display, bool isLinux) {
+    if (isLinux)
+        return std::format("/tmp/.X11-unix/X{}", display);
+
+    return std::format("/tmp/.X11-unix/X{}_", display);
 }
 
-static CFileDescriptor createListenSocket(struct sockaddr_un* addr, size_t pathSize) {
+static CFileDescriptor createSocket(struct sockaddr_un* addr, size_t pathSize) {
     const bool        isRegularSocket(addr->sun_path[0]);
     const char        dbgSocketPathPrefix = isRegularSocket ? addr->sun_path[0] : '@';
     const char* const dbgSocketPathRem    = addr->sun_path + 1;
@@ -61,16 +65,15 @@ static CFileDescriptor createListenSocket(struct sockaddr_un* addr, size_t pathS
     if (isRegularSocket)
         unlink(addr->sun_path);
 
-    if (bind(fd.get(), reinterpret_cast<struct sockaddr*>(addr), size) < 0) {
+    if (bind(fd.get(), rc<struct sockaddr*>(addr), size) < 0) {
         Log::logger->log(Log::ERR, "[XWayland-Satellite] Failed to bind socket {}{}", dbgSocketPathPrefix, dbgSocketPathRem);
         if (isRegularSocket)
             unlink(addr->sun_path);
         return {};
     }
 
-    if (isRegularSocket && chmod(addr->sun_path, 0666) < 0) {
+    if (isRegularSocket && chmod(addr->sun_path, 0666) < 0)
         Log::logger->log(Log::ERR, "[XWayland-Satellite] Failed to set permission mode for socket {}{}", dbgSocketPathPrefix, dbgSocketPathRem);
-    }
 
     if (listen(fd.get(), SOCKET_BACKLOG) < 0) {
         Log::logger->log(Log::ERR, "[XWayland-Satellite] Failed to listen to socket {}{}", dbgSocketPathPrefix, dbgSocketPathRem);
@@ -82,37 +85,7 @@ static CFileDescriptor createListenSocket(struct sockaddr_un* addr, size_t pathS
     return fd;
 }
 
-CXWaylandSatellite::CXWaylandSatellite() {
-    ;
-}
-
-CXWaylandSatellite::~CXWaylandSatellite() {
-    removeWatches();
-
-    if (m_display < 0)
-        return;
-
-    if (!m_lockPath.empty())
-        safeRemove(m_lockPath);
-    if (!m_socketPathRegular.empty())
-        safeRemove(m_socketPathRegular);
-
-    unsetenv("DISPLAY");
-}
-
-bool CXWaylandSatellite::ensureSocketDir() {
-    if (mkdir("/tmp/.X11-unix", SOCKET_DIR_PERMISSIONS) != 0) {
-        if (errno == EEXIST)
-            return checkSocketDirPerms();
-        else {
-            Log::logger->log(Log::ERR, "[XWayland-Satellite] Couldn't create socket dir /tmp/.X11-unix");
-            return false;
-        }
-    }
-    return true;
-}
-
-bool CXWaylandSatellite::checkSocketDirPerms() {
+static bool checkPermissionsForSocketDir() {
     struct stat buf;
 
     if (lstat("/tmp/.X11-unix", &buf)) {
@@ -140,80 +113,117 @@ bool CXWaylandSatellite::checkSocketDirPerms() {
     return true;
 }
 
-bool CXWaylandSatellite::tryOpenSockets() {
-    static auto PCREATEABSTRACTSOCKET = CConfigValue<Config::INTEGER>("xwayland:create_abstract_socket");
+static bool ensureSocketDirExists() {
+    if (mkdir("/tmp/.X11-unix", SOCKET_DIR_PERMISSIONS) != 0) {
+        if (errno == EEXIST)
+            return checkPermissionsForSocketDir();
 
-    if (!ensureSocketDir())
+        Log::logger->log(Log::ERR, "[XWayland-Satellite] Couldn't create socket dir /tmp/.X11-unix");
+        return false;
+    }
+
+    return true;
+}
+
+static bool openSockets(std::array<CFileDescriptor, 2>& sockets, int display) {
+    static auto CREATEABSTRACTSOCKET = CConfigValue<Config::INTEGER>("xwayland:create_abstract_socket");
+
+    if (!ensureSocketDirExists())
         return false;
 
-    for (int i = 0; i <= MAX_DISPLAY_RETRIES; ++i) {
-        std::string     lockPath = std::format("/tmp/.X{}-lock", i);
+    sockaddr_un addr = {.sun_family = AF_UNIX};
+    std::string path;
 
-        CFileDescriptor lockFd{open(lockPath.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, LOCK_FILE_MODE)};
-        if (lockFd.isValid()) {
-            // We managed to create the lock file
-            sockaddr_un addr = {.sun_family = AF_UNIX};
-            std::string path;
-
-            // Socket 0: abstract (if enabled) or regular fallback
 #ifdef __linux__
-            if (*PCREATEABSTRACTSOCKET) {
-                addr.sun_path[0] = '\0';
-                path             = getSocketPath(i);
-                strncpy(addr.sun_path + 1, path.c_str(), sizeof(addr.sun_path) - 2);
-            } else {
-                path = std::format("/tmp/.X11-unix/X{}_", i);
-                strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-                addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
-            }
+    if (*CREATEABSTRACTSOCKET) {
+        addr.sun_path[0] = '\0';
+        path             = getSocketPath(display, true);
+
+        strncpy(addr.sun_path + 1, path.c_str(), sizeof(addr.sun_path) - 2);
+    } else {
+        path = getSocketPath(display, false);
+
+        strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+        addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+    }
 #else
-            path = std::format("/tmp/.X11-unix/X{}_", i);
-            strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-            addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+    if (*CREATEABSTRACTSOCKET)
+        Log::logger->log(Log::WARN, "[XWayland-Satellite] Abstract X11 socket is only available on Linux. A regular one will be created instead.");
+
+    path = getSocketPath(display, false);
+
+    strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
 #endif
 
-            m_xFDs[0] = CFileDescriptor{createListenSocket(&addr, path.length())};
+    sockets[0] = CFileDescriptor{createSocket(&addr, path.length())};
+    if (!sockets[0].isValid())
+        return false;
 
-            if (!m_xFDs[0].isValid()) {
+    path = getSocketPath(display, true);
+    strncpy(addr.sun_path, path.c_str(), path.length() + 1);
+
+    sockets[1] = CFileDescriptor{createSocket(&addr, path.length())};
+    if (!sockets[1].isValid()) {
+        sockets[0].reset();
+        return false;
+    }
+
+    return true;
+}
+
+CXWaylandSatellite::CXWaylandSatellite() {
+    ;
+}
+
+CXWaylandSatellite::~CXWaylandSatellite() {
+    removeWatches();
+
+    if (m_display < 0)
+        return;
+
+    std::string lockPath = std::format("/tmp/.X{}-lock", m_display);
+    safeRemove(lockPath);
+
+    std::string path;
+    for (bool isLinux : {true, false}) {
+        path = getSocketPath(m_display, isLinux);
+        safeRemove(path);
+    }
+
+    unsetenv("DISPLAY");
+}
+
+bool CXWaylandSatellite::tryOpenSockets() {
+    for (int i = 0; i <= MAX_DISPLAY_RETRIES; ++i) {
+        const std::string lockPath = std::format("/tmp/.X{}-lock", i);
+
+        CFileDescriptor   fd{open(lockPath.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, LOCK_FILE_MODE)};
+        if (fd.isValid()) {
+            if (!openSockets(m_xFDs, i)) {
                 safeRemove(lockPath);
                 continue;
             }
 
-            // Socket 1: regular unix socket
-            path = getSocketPath(i);
-            strncpy(addr.sun_path, path.c_str(), path.length() + 1);
-            addr.sun_family = AF_UNIX;
-
-            m_xFDs[1] = CFileDescriptor{createListenSocket(&addr, path.length())};
-            if (!m_xFDs[1].isValid()) {
-                m_xFDs[0].reset();
-                safeRemove(lockPath);
-                continue;
-            }
-
-            // Write PID to lock file
             const std::string pidStr = std::format("{:010d}\n", getpid());
-            if (write(lockFd.get(), pidStr.c_str(), 11) != 11L) {
+            if (write(fd.get(), pidStr.c_str(), 11) != 11L) {
                 m_xFDs[0].reset();
                 m_xFDs[1].reset();
                 safeRemove(lockPath);
                 continue;
             }
 
-            m_display           = i;
-            m_displayName       = std::format(":{}", m_display);
-            m_lockPath          = lockPath;
-            m_socketPathRegular = getSocketPath(i);
+            m_display     = i;
+            m_displayName = std::format(":{}", m_display);
             break;
         }
 
-        // Lock file already exists — check if the process is dead
-        lockFd = CFileDescriptor{open(lockPath.c_str(), O_RDONLY | O_CLOEXEC)};
-        if (!lockFd.isValid())
+        fd = CFileDescriptor{open(lockPath.c_str(), O_RDONLY | O_CLOEXEC)};
+        if (!fd.isValid())
             continue;
 
         char pidstr[12] = {0};
-        if (read(lockFd.get(), pidstr, sizeof(pidstr) - 1) < 0)
+        if (read(fd.get(), pidstr, sizeof(pidstr) - 1) < 0)
             continue;
 
         int32_t pid = 0;
@@ -224,7 +234,7 @@ bool CXWaylandSatellite::tryOpenSockets() {
         if (kill(pid, 0) != 0 && errno == ESRCH) {
             if (!safeRemove(lockPath))
                 continue;
-            i--; // retry this display number
+            i--;
         }
     }
 
@@ -238,9 +248,6 @@ bool CXWaylandSatellite::tryOpenSockets() {
 }
 
 bool CXWaylandSatellite::testOnDemand(const std::string& path) {
-    // Test if xwayland-satellite supports on-demand activation
-    // We use a pipe and a double-fork because Hyprland sets SIGCHLD to SA_NOCLDWAIT,
-    // which causes waitpid to always return ECHILD without the exit status.
     int pipefd[2];
     if (pipe(pipefd) < 0) {
         Log::logger->log(Log::ERR, "[XWayland-Satellite] pipe failed for test: {}", strerror(errno));
@@ -256,10 +263,8 @@ bool CXWaylandSatellite::testOnDemand(const std::string& path) {
     }
 
     if (pid == 0) {
-        // Child 1
         close(pipefd[0]);
 
-        // Clear SA_NOCLDWAIT so waitpid works in this child
         struct sigaction act;
         act.sa_handler = SIG_DFL;
         sigemptyset(&act.sa_mask);
@@ -268,8 +273,6 @@ bool CXWaylandSatellite::testOnDemand(const std::string& path) {
 
         pid_t pid2 = fork();
         if (pid2 == 0) {
-            // Child 2
-            // Redirect stdout/stderr to /dev/null
             int devnull = open("/dev/null", O_WRONLY);
             if (devnull >= 0) {
                 dup2(devnull, STDOUT_FILENO);
@@ -282,34 +285,35 @@ bool CXWaylandSatellite::testOnDemand(const std::string& path) {
             unsetenv("RUST_LIB_BACKTRACE");
 
             execlp(path.c_str(), path.c_str(), ":0", "--test-listenfd-support", nullptr);
-            _exit(127); // exec failed
+            _exit(127);
         }
 
         int status = 0;
         waitpid(pid2, &status, 0);
-        int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 255;
-        if (write(pipefd[1], &exit_code, sizeof(exit_code)) < 0) {
-            // Nothing we can do
+        int exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : 255;
+        if (write(pipefd[1], &exitCode, sizeof(exitCode)) < 0) {
+            // nothing we can do
         }
         _exit(0);
     }
 
-    // Parent
     close(pipefd[1]);
-    int     exit_code  = -1;
-    ssize_t bytes_read = read(pipefd[0], &exit_code, sizeof(exit_code));
+
+    int     exitCode  = -1;
+    ssize_t bytesRead = read(pipefd[0], &exitCode, sizeof(exitCode));
     close(pipefd[0]);
 
-    if (bytes_read != sizeof(exit_code)) {
+    if (bytesRead != sizeof(exitCode)) {
         Log::logger->log(Log::INFO, "[XWayland-Satellite] Error waiting for xwayland-satellite test: Failed to read from pipe");
         return false;
     }
 
-    if (exit_code != 0) {
-        if (exit_code == 127)
+    if (exitCode != 0) {
+        if (exitCode == 127)
             Log::logger->log(Log::INFO, "[XWayland-Satellite] xwayland-satellite not found at '{}', disabling integration", path);
         else
             Log::logger->log(Log::INFO, "[XWayland-Satellite] xwayland-satellite doesn't support on-demand activation, disabling integration");
+
         return false;
     }
 
@@ -317,11 +321,11 @@ bool CXWaylandSatellite::testOnDemand(const std::string& path) {
 }
 
 bool CXWaylandSatellite::setup(wl_event_loop* eventLoop) {
-    static auto PSATELLITEPATH = CConfigValue<Config::STRING>("xwayland:satellite_path");
+    static auto SATELLITEPATH = CConfigValue<Config::STRING>("xwayland:satellite_path");
 
     m_eventLoop = eventLoop;
 
-    std::string satPath = *PSATELLITEPATH;
+    std::string satPath = *SATELLITEPATH;
     if (satPath.empty())
         satPath = "xwayland-satellite";
 
@@ -340,8 +344,6 @@ bool CXWaylandSatellite::setup(wl_event_loop* eventLoop) {
 }
 
 void CXWaylandSatellite::clearPendingConnections(CFileDescriptor& fd) {
-    // Accept and drop all pending connections to prevent busyloop
-    // when xwayland-satellite fails to start
     int flags = fcntl(fd.get(), F_GETFL);
     if (flags < 0)
         return;
@@ -351,13 +353,14 @@ void CXWaylandSatellite::clearPendingConnections(CFileDescriptor& fd) {
     struct sockaddr_un addr;
     socklen_t          len = sizeof(addr);
     while (true) {
-        int clientFd = accept(fd.get(), reinterpret_cast<struct sockaddr*>(&addr), &len);
+        int clientFd = accept(fd.get(), rc<struct sockaddr*>(&addr), &len);
         if (clientFd < 0)
             break;
+
         close(clientFd);
     }
 
-    fcntl(fd.get(), F_SETFL, flags); // restore
+    fcntl(fd.get(), F_SETFL, flags);
 }
 
 void CXWaylandSatellite::removeWatches() {
@@ -365,6 +368,7 @@ void CXWaylandSatellite::removeWatches() {
         wl_event_source_remove(m_abstractWatch);
         m_abstractWatch = nullptr;
     }
+
     if (m_unixWatch) {
         wl_event_source_remove(m_unixWatch);
         m_unixWatch = nullptr;
@@ -376,10 +380,7 @@ int CXWaylandSatellite::onSocketActivity(int fd, uint32_t mask, void* data) {
 
     Log::logger->log(Log::DEBUG, "[XWayland-Satellite] Connection on X11 socket; spawning xwayland-satellite");
 
-    // Remove both watchers before spawning
     self->removeWatches();
-
-    // Spawn in a detached thread so we don't block the compositor
     self->spawn();
 
     return 0;
@@ -391,7 +392,6 @@ void CXWaylandSatellite::setupWatch() {
     if (!m_eventLoop || !m_xFDs[0].isValid() || !m_xFDs[1].isValid())
         return;
 
-    // Clear pending connections before watching
     clearPendingConnections(m_xFDs[0]);
     clearPendingConnections(m_xFDs[1]);
 
@@ -400,13 +400,12 @@ void CXWaylandSatellite::setupWatch() {
 }
 
 void CXWaylandSatellite::spawn() {
-    static auto PSATELLITEPATH = CConfigValue<Config::STRING>("xwayland:satellite_path");
+    static auto SATELLITEPATH = CConfigValue<Config::STRING>("xwayland:satellite_path");
 
-    std::string satPath = *PSATELLITEPATH;
+    std::string satPath = *SATELLITEPATH;
     if (satPath.empty())
         satPath = "xwayland-satellite";
 
-    // Duplicate FDs to pass to child. The originals must remain open for re-watching.
     CFileDescriptor abstractFd{dup(m_xFDs[0].get())};
     CFileDescriptor unixFd{dup(m_xFDs[1].get())};
 
@@ -419,12 +418,10 @@ void CXWaylandSatellite::spawn() {
     int abstractRaw = abstractFd.get();
     int unixRaw     = unixFd.get();
 
-    // Spawn in a thread to avoid blocking the compositor event loop
     std::thread([this, satPath, abstractRaw, unixRaw, abstractFd = std::move(abstractFd), unixFd = std::move(unixFd)]() mutable {
         pid_t pid = fork();
         if (pid < 0) {
             Log::logger->log(Log::ERR, "[XWayland-Satellite] fork failed: {}", strerror(errno));
-            // Re-register watches from the main thread
             wl_event_loop_add_idle(
                 m_eventLoop,
                 [](void* data) {
@@ -436,13 +433,9 @@ void CXWaylandSatellite::spawn() {
         }
 
         if (pid == 0) {
-            // Child process
-
-            // Clear CLOEXEC on the FDs we want to pass
             fcntl(abstractRaw, F_SETFD, 0);
             fcntl(unixRaw, F_SETFD, 0);
 
-            // Redirect output to /dev/null
             int devnull = open("/dev/null", O_WRONLY);
             if (devnull >= 0) {
                 dup2(devnull, STDOUT_FILENO);
@@ -463,24 +456,18 @@ void CXWaylandSatellite::spawn() {
             _exit(127);
         }
 
-        // Parent (spawner thread)
-        // Close our copies, child inherited them
         abstractFd.reset();
         unixFd.reset();
 
         int status = 0;
         if (waitpid(pid, &status, 0) < 0) {
-            if (errno == ECHILD) {
-                // ECHILD is expected because Hyprland sets SA_NOCLDWAIT. The child has terminated.
+            if (errno == ECHILD)
                 Log::logger->log(Log::WARN, "[XWayland-Satellite] xwayland-satellite terminated");
-            } else {
+            else
                 Log::logger->log(Log::WARN, "[XWayland-Satellite] Error waiting for xwayland-satellite: {}", strerror(errno));
-            }
-        } else {
+        } else
             Log::logger->log(Log::WARN, "[XWayland-Satellite] xwayland-satellite exited with status {}", WEXITSTATUS(status));
-        }
 
-        // Re-register watches from the main thread via idle callback
         wl_event_loop_add_idle(
             m_eventLoop,
             [](void* data) {

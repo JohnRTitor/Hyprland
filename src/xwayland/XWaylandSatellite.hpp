@@ -25,8 +25,6 @@ class CXWaylandSatellite {
     const std::string& displayName() const;
 
   private:
-    bool        ensureSocketDir();
-    bool        checkSocketDirPerms();
     bool        tryOpenSockets();
     bool        testOnDemand(const std::string& path);
     void        spawn();
