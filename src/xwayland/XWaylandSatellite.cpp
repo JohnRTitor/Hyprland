@@ -177,7 +177,10 @@ CXWaylandSatellite::CXWaylandSatellite() {
 }
 
 CXWaylandSatellite::~CXWaylandSatellite() {
+    m_shuttingDown = true;
     removeWatches();
+    if (m_spawnThread.joinable())
+        m_spawnThread.join();
 
     if (m_display < 0)
         return;
@@ -377,6 +380,8 @@ void CXWaylandSatellite::removeWatches() {
 
 int CXWaylandSatellite::onSocketActivity(int fd, uint32_t mask, void* data) {
     auto* self = static_cast<CXWaylandSatellite*>(data);
+    if (self->m_shuttingDown)
+        return 0;
 
     Log::logger->log(Log::DEBUG, "[XWayland-Satellite] Connection on X11 socket; spawning xwayland-satellite");
 
@@ -418,17 +423,23 @@ void CXWaylandSatellite::spawn() {
     int abstractRaw = abstractFd.get();
     int unixRaw     = unixFd.get();
 
-    std::thread([this, satPath, abstractRaw, unixRaw, abstractFd = std::move(abstractFd), unixFd = std::move(unixFd)]() mutable {
+    if (m_spawnThread.joinable())
+        m_spawnThread.join();
+
+    m_spawnThread = std::thread([this, satPath, abstractRaw, unixRaw, abstractFd = std::move(abstractFd), unixFd = std::move(unixFd)]() mutable {
         pid_t pid = fork();
         if (pid < 0) {
             Log::logger->log(Log::ERR, "[XWayland-Satellite] fork failed: {}", strerror(errno));
-            wl_event_loop_add_idle(
-                m_eventLoop,
-                [](void* data) {
-                    auto* self = static_cast<CXWaylandSatellite*>(data);
-                    self->setupWatch();
-                },
-                this);
+            if (!m_shuttingDown && m_eventLoop) {
+                wl_event_loop_add_idle(
+                    m_eventLoop,
+                    [](void* data) {
+                        auto* self = static_cast<CXWaylandSatellite*>(data);
+                        if (!self->m_shuttingDown)
+                            self->setupWatch();
+                    },
+                    this);
+            }
             return;
         }
 
@@ -468,14 +479,17 @@ void CXWaylandSatellite::spawn() {
         } else
             Log::logger->log(Log::WARN, "[XWayland-Satellite] xwayland-satellite exited with status {}", WEXITSTATUS(status));
 
-        wl_event_loop_add_idle(
-            m_eventLoop,
-            [](void* data) {
-                auto* self = static_cast<CXWaylandSatellite*>(data);
-                self->setupWatch();
-            },
-            this);
-    }).detach();
+        if (!m_shuttingDown && m_eventLoop) {
+            wl_event_loop_add_idle(
+                m_eventLoop,
+                [](void* data) {
+                    auto* self = static_cast<CXWaylandSatellite*>(data);
+                    if (!self->m_shuttingDown)
+                        self->setupWatch();
+                },
+                this);
+        }
+    });
 }
 
 bool CXWaylandSatellite::enabled() const {

@@ -3,6 +3,7 @@
 #ifdef USE_XWAYLAND_SATELLITE
 
 #include <array>
+#include <atomic>
 #include <string>
 #include <thread>
 #include <hyprutils/os/FileDescriptor.hpp>
@@ -43,6 +44,8 @@ class CXWaylandSatellite {
     wl_event_source*                              m_unixWatch     = nullptr;
     wl_event_loop*                                m_eventLoop     = nullptr;
     bool                                          m_enabled       = false;
+    std::atomic<bool>                             m_shuttingDown  = false;
+    std::thread                                   m_spawnThread;
 
     // Lock file path for cleanup
     std::string m_lockPath;
