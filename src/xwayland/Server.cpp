@@ -25,6 +25,8 @@
 #include "../defines.hpp"
 #include "../Compositor.hpp"
 #include "../managers/CursorManager.hpp"
+#include "../helpers/env/Env.hpp"
+#include "../config/supplementary/executor/Executor.hpp"
 using namespace Hyprutils::OS;
 
 // Constants
@@ -404,6 +406,23 @@ int CXWaylandServer::ready(int fd, uint32_t mask) {
             mask = 0;
         } else if (n <= 0 || buf[n - 1] != '\n')
             return 1;
+        else {
+            // Xwayland wrote the actual display number it chose. Parse it and
+            // update our state so that DISPLAY reflects reality.
+            buf[n - 1]        = '\0';
+            int actualDisplay = -1;
+            try {
+                actualDisplay = std::stoi(std::string(buf));
+            } catch (...) { Log::logger->log(Log::ERR, "Xwayland: failed to parse display number from displayFd: '{}'", buf); }
+
+            if (actualDisplay >= 0 && actualDisplay != m_display) {
+                Log::logger->log(Log::DEBUG, "Xwayland: display changed from :{} to :{}", m_display, actualDisplay);
+                m_display     = actualDisplay;
+                m_displayName = std::format(":{}", m_display);
+            }
+
+            setenv("DISPLAY", m_displayName.c_str(), true);
+        }
     }
 
     // if we don't have readable here, it failed
